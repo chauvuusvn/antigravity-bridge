@@ -1,3 +1,5 @@
+**English** | [Tiếng Việt](README_VI.md)
+
 # Antigravity OAuth Bridge
 
 A local bridge that serves the models available to your **Google Antigravity**
@@ -207,6 +209,7 @@ bridge/
 tests/                  pytest suite (auth isolation, refresh, hardening, schemas)
 antigravity-bridge@.service   systemd --user template unit
 claude_litellm_config.yaml    LiteLLM example config
+README_VI.md                  Vietnamese documentation
 ```
 
 ## Tests
