@@ -47,7 +47,10 @@ if [[ ! -f "$KEYS_FILE" ]]; then echo "ERROR: $KEYS_FILE missing (see bridge/key
 KEY=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$KEYS_FILE" "$ACCOUNT")
 
 export HOME="$HOME_DIR"
+# Pass the key via the environment, never argv: /proc/<pid>/cmdline is
+# readable by every local user, an environment variable is not listed by ps.
+export ANTIGRAVITY_BRIDGE_API_KEY="$KEY"
 cd "$REPO_DIR"
 exec "$PYTHON_BIN" -u -m bridge.server \
   --host "$BIND_HOST" --port "$PORT" \
-  --api-key "$KEY" --home "$HOME_DIR"
+  --api-key-env ANTIGRAVITY_BRIDGE_API_KEY --home "$HOME_DIR"

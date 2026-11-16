@@ -87,12 +87,26 @@ class AntigravityBridgeServer:
         and keyless requests from LAN/Tailscale peers are no longer accepted.
         Every legitimate local client already holds the real
         per-instance key from bridge/keys.json.
+
+        The scheme match is case-insensitive (per RFC 7235), a correct
+        x-api-key is honoured even when a wrong Authorization header is
+        also present, and comparison is byte-wise so a non-ASCII token
+        yields a clean 401 instead of crashing compare_digest with a 500.
         """
-        auth_header = request.headers.get("Authorization") or request.headers.get("x-api-key") or ""
-        bearer = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header.strip()
-        if not bearer or not self.api_key:
+        if not self.api_key:
             return False
-        return hmac.compare_digest(bearer, self.api_key)
+        candidates = []
+        auth_header = request.headers.get("Authorization")
+        if auth_header:
+            if auth_header.lower().startswith("bearer "):
+                candidates.append(auth_header[7:].strip())
+            else:
+                candidates.append(auth_header.strip())
+        api_key_header = request.headers.get("x-api-key")
+        if api_key_header:
+            candidates.append(api_key_header.strip())
+        expected = self.api_key.encode("utf-8")
+        return any(c and hmac.compare_digest(c.encode("utf-8"), expected) for c in candidates)
 
     @staticmethod
     def _status_for_error(e: Exception) -> int:
@@ -107,7 +121,40 @@ class AntigravityBridgeServer:
             return e.status_code if 400 <= e.status_code <= 599 else 500
         if "unauthorized" in str(e):
             return 401
+        if "token refresh failed" in str(e):
+            return 502
         return 500
+
+    @staticmethod
+    def _validate_payload(payload) -> Optional[str]:
+        """Return an error message if the decoded JSON body is unusable.
+
+        Valid JSON that is not an object (a list, a string, a number)
+        used to crash the handlers with a 500, and a non-list "messages"
+        was silently replaced with an invented "Hello" upstream. Both
+        are client errors: answer 400.
+        """
+        if not isinstance(payload, dict):
+            return "Request body must be a JSON object."
+        messages = payload.get("messages")
+        if messages is not None and not isinstance(messages, list):
+            return '"messages" must be an array.'
+        return None
+
+    @staticmethod
+    def _anthropic_error(message: str, status: int) -> web.Response:
+        """Anthropic-shaped error envelope: {"type": "error", "error": {...}}."""
+        err_type = {
+            400: "invalid_request_error",
+            401: "authentication_error",
+            403: "permission_error",
+            404: "not_found_error",
+            429: "rate_limit_error",
+        }.get(status, "api_error")
+        return web.json_response(
+            {"type": "error", "error": {"type": err_type, "message": message}},
+            status=status,
+        )
 
     async def handle_list_models(self, request: web.Request) -> web.Response:
         if not self._check_auth(request):
@@ -137,6 +184,13 @@ class AntigravityBridgeServer:
                 status=400,
             )
 
+        validation_error = self._validate_payload(payload)
+        if validation_error:
+            return web.json_response(
+                {"error": {"message": validation_error, "type": "invalid_request_error"}},
+                status=400,
+            )
+
         is_stream = bool(payload.get("stream"))
         if is_stream:
             stream_gen = self.client.stream_chat_completion(payload, bearer_token=bearer)
@@ -160,7 +214,16 @@ class AntigravityBridgeServer:
                     async for chunk_str in stream_gen:
                         await response.write(chunk_str.encode("utf-8"))
                 except Exception as e:
+                    # Mid-stream failure: tell the client explicitly
+                    # instead of a clean EOF that looks like a complete
+                    # (but truncated) answer.
                     logger.error("Stream error: %s", e)
+                    try:
+                        err_chunk = {"error": {"message": str(e), "type": "api_error", "code": self._status_for_error(e)}}
+                        await response.write(f"data: {json.dumps(err_chunk)}\n\n".encode("utf-8"))
+                        await response.write(b"data: [DONE]\n\n")
+                    except Exception:
+                        pass
                 await response.write_eof()
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
                 logger.debug("Client disconnected: %s", e)
@@ -187,16 +250,17 @@ class AntigravityBridgeServer:
     async def handle_anthropic_messages(self, request: web.Request) -> web.StreamResponse:
         """Handle Anthropic /v1/messages requests from Claude Code CLI."""
         if not self._check_auth(request):
-            return web.json_response({"error": {"message": "unauthorized", "type": "authentication_error"}}, status=401)
+            return self._anthropic_error("unauthorized", 401)
         bearer = self.api_key
 
         try:
             anthropic_payload = await request.json()
         except Exception as e:
-            return web.json_response(
-                {"error": {"message": f"Invalid JSON payload: {e}", "type": "invalid_request_error"}},
-                status=400,
-            )
+            return self._anthropic_error(f"Invalid JSON payload: {e}", 400)
+
+        validation_error = self._validate_payload(anthropic_payload)
+        if validation_error:
+            return self._anthropic_error(validation_error, 400)
 
         model_name = anthropic_payload.get("model", "claude-3-7-sonnet-20250219")
         openai_payload = translate_anthropic_payload_to_openai(anthropic_payload)
@@ -210,11 +274,7 @@ class AntigravityBridgeServer:
                 first_event = await anthropic_sse_gen.__anext__()
             except Exception as e:
                 logger.error("Anthropic stream connect error: %s", e)
-                status_code = self._status_for_error(e)
-                return web.json_response(
-                    {"error": {"message": str(e), "type": "api_error"}},
-                    status=status_code,
-                )
+                return self._anthropic_error(str(e), self._status_for_error(e))
 
             response = web.StreamResponse(
                 status=200, reason="OK",
@@ -228,6 +288,11 @@ class AntigravityBridgeServer:
                         await response.write(event_str.encode("utf-8"))
                 except Exception as e:
                     logger.error("Anthropic SSE stream error: %s", e)
+                    try:
+                        err_event = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                        await response.write(f"event: error\ndata: {json.dumps(err_event)}\n\n".encode("utf-8"))
+                    except Exception:
+                        pass
                 await response.write_eof()
             except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
                 logger.debug("Anthropic client disconnected: %s", e)
@@ -241,11 +306,7 @@ class AntigravityBridgeServer:
                 return web.json_response(anthropic_resp)
             except Exception as e:
                 logger.error("Anthropic messages error: %s", e)
-                status_code = self._status_for_error(e)
-                return web.json_response(
-                    {"error": {"message": str(e), "type": "api_error"}},
-                    status=status_code,
-                )
+                return self._anthropic_error(str(e), self._status_for_error(e))
 
 
 def run_server(host: str = DEFAULT_BRIDGE_HOST, port: int = DEFAULT_BRIDGE_PORT,

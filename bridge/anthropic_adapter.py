@@ -36,6 +36,22 @@ def map_anthropic_model(requested: Any) -> str:
     return name
 
 
+def _anthropic_stop_reason(openai_finish: Any, has_tool_calls: bool) -> str:
+    """Map an OpenAI finish_reason to the Anthropic stop_reason vocabulary.
+
+    A truncated answer is "max_tokens", not "end_turn" (the old mapping
+    claimed every non-tool answer ended naturally).
+    """
+    if has_tool_calls:
+        return "tool_use"
+    return {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "content_filter": "refusal",
+        "tool_calls": "tool_use",
+    }.get(str(openai_finish or "stop"), "end_turn")
+
+
 def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Convert an Anthropic /v1/messages payload to OpenAI chat completions format."""
     messages: List[Dict[str, Any]] = []
@@ -59,6 +75,7 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             text_parts = []
+            image_parts = []
             tool_calls = []
             tool_results = []
 
@@ -68,6 +85,21 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
                 b_type = block.get("type")
                 if b_type == "text":
                     text_parts.append(block.get("text", ""))
+                elif b_type == "image":
+                    # Anthropic image block -> OpenAI image_url part.
+                    # (Images used to be silently dropped entirely.)
+                    source = block.get("source") or {}
+                    if source.get("type") == "base64" and source.get("data"):
+                        media = source.get("media_type") or "image/png"
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media};base64,{source['data']}"},
+                        })
+                    elif source.get("type") == "url" and source.get("url"):
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": source["url"]},
+                        })
                 elif b_type == "tool_use":
                     tool_id = block.get("id") or f"call_{uuid.uuid4().hex[:8]}"
                     tool_name = block.get("name", "")
@@ -85,10 +117,15 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
                     t_content = block.get("content", "")
                     if isinstance(t_content, list):
                         t_content = "\n".join(b.get("text", "") for b in t_content if isinstance(b, dict) and b.get("type") == "text")
+                    t_content = str(t_content)
+                    if block.get("is_error"):
+                        # OpenAI tool messages have no is_error flag;
+                        # keep the failure visible to the model as text.
+                        t_content = f"[tool returned an error] {t_content}"
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
-                        "content": str(t_content)
+                        "content": t_content
                     })
 
             if role == "assistant":
@@ -103,7 +140,13 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
                 if tool_results:
                     for tr in tool_results:
                         messages.append(tr)
-                if text_parts:
+                if image_parts:
+                    parts: List[Dict[str, Any]] = []
+                    if text_parts:
+                        parts.append({"type": "text", "text": "\n".join(text_parts)})
+                    parts.extend(image_parts)
+                    messages.append({"role": "user", "content": parts})
+                elif text_parts:
                     messages.append({"role": "user", "content": "\n".join(text_parts)})
 
     # 3. Tools translation
@@ -136,6 +179,27 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
         openai_payload["max_tokens"] = payload["max_tokens"]
     if "temperature" in payload:
         openai_payload["temperature"] = payload["temperature"]
+    if "top_p" in payload:
+        openai_payload["top_p"] = payload["top_p"]
+    if payload.get("stop_sequences"):
+        openai_payload["stop"] = payload["stop_sequences"]
+
+    tool_choice = payload.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if tc_type == "auto":
+            openai_payload["tool_choice"] = "auto"
+        elif tc_type == "any":
+            openai_payload["tool_choice"] = "required"
+        elif tc_type == "none":
+            openai_payload["tool_choice"] = "none"
+        elif tc_type == "tool" and tool_choice.get("name"):
+            openai_payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": tool_choice["name"]},
+            }
+    elif isinstance(tool_choice, str):
+        openai_payload["tool_choice"] = tool_choice
 
     return openai_payload
 
@@ -148,6 +212,10 @@ def translate_openai_response_to_anthropic(openai_resp: Dict[str, Any], model_na
     msg = first_choice.get("message", {})
 
     content_blocks: List[Dict[str, Any]] = []
+
+    reasoning = msg.get("reasoning_content")
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
 
     text = msg.get("content")
     if text:
@@ -167,7 +235,7 @@ def translate_openai_response_to_anthropic(openai_resp: Dict[str, Any], model_na
             "input": parsed_input
         })
 
-    stop_reason = "tool_use" if tool_calls else ("end_turn" if first_choice.get("finish_reason") == "stop" else "end_turn")
+    stop_reason = _anthropic_stop_reason(first_choice.get("finish_reason"), bool(tool_calls))
 
     usage = openai_resp.get("usage", {})
     return {
@@ -210,6 +278,8 @@ async def stream_anthropic_sse_adapter(openai_stream_gen: AsyncIterator[str], mo
     block_index = 0
     accumulated_tool_calls: Dict[int, Dict[str, Any]] = {}
     total_output_tokens = 0
+    last_finish_reason: Any = None
+    stream_usage: Dict[str, Any] = {}
 
     async for chunk_str in openai_stream_gen:
         lines = chunk_str.strip().split("\n")
@@ -223,10 +293,26 @@ async def stream_anthropic_sse_adapter(openai_stream_gen: AsyncIterator[str], mo
             except Exception:
                 continue
 
+            if isinstance(data.get("usage"), dict):
+                stream_usage = data["usage"]
             choices = data.get("choices") or []
             if not choices:
                 continue
+            if choices[0].get("finish_reason"):
+                last_finish_reason = choices[0]["finish_reason"]
             delta = choices[0].get("delta") or {}
+
+            # Handle reasoning content -> Anthropic thinking block
+            reasoning_piece = delta.get("reasoning_content")
+            if reasoning_piece:
+                total_output_tokens += 1
+                if current_block_type != "thinking":
+                    if current_block_type is not None:
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
+                        block_index += 1
+                    current_block_type = "thinking"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_piece}})}\n\n"
 
             # Handle text content
             content_piece = delta.get("content")
@@ -267,12 +353,17 @@ async def stream_anthropic_sse_adapter(openai_stream_gen: AsyncIterator[str], mo
     if current_block_type is not None:
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
 
-    # message_delta and message_stop
-    stop_reason = "tool_use" if accumulated_tool_calls else "end_turn"
+    # message_delta and message_stop: real stop reason and real usage
+    # when the upstream stream reported them; chunk count is only a
+    # fallback estimate, never a fabricated constant presented as fact.
+    stop_reason = _anthropic_stop_reason(last_finish_reason, bool(accumulated_tool_calls))
+    output_tokens = stream_usage.get("completion_tokens")
+    if not isinstance(output_tokens, int) or output_tokens <= 0:
+        output_tokens = max(total_output_tokens, 1)
     delta_event = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": max(total_output_tokens, 10)}
+        "usage": {"output_tokens": output_tokens}
     }
     yield f"event: message_delta\ndata: {json.dumps(delta_event)}\n\n"
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"

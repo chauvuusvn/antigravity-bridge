@@ -11,11 +11,13 @@ Security model:
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -49,7 +51,15 @@ class AntigravityCredentials:
     def is_expired(self) -> bool:
         if not self.access_token:
             return True
-        if self.expires_at <= 0:
+        if self.expires_at < 0:
+            # The token file states an expiry we could not parse: that
+            # must NOT mean "never expires" (the old behaviour). Treat it
+            # as expired so a refresh is attempted instead of sending a
+            # possibly-dead token upstream.
+            return True
+        if self.expires_at == 0:
+            # No expiry recorded at all (legacy agy string-token format):
+            # there is nothing to check against, keep accepting the token.
             return False
         return (self.expires_at - time.time()) < REFRESH_SKEW_SECONDS
 
@@ -132,35 +142,57 @@ class AntigravityAuthManager:
             raw_expiry = None
         if not token:
             return None
+        if raw_expiry is None:
+            expires_at = 0.0  # no expiry recorded (legacy format)
+        else:
+            expires_at = _parse_expiry(raw_expiry)
+            if expires_at == 0.0 and str(raw_expiry).strip() not in ("0", "0.0"):
+                expires_at = -1.0  # expiry present but unparseable
         creds = AntigravityCredentials(
             access_token=token,
             refresh_token=refresh,
-            expires_at=_parse_expiry(raw_expiry),
+            expires_at=expires_at,
             email=data.get("email") or "",
+            project_id=(data.get("project_id") or token_field.get("project_id") or "") if isinstance(token_field, dict) else (data.get("project_id") or ""),
             source="instance_home",
         )
         return creds
 
     def _write_token_file(self, creds: AntigravityCredentials) -> None:
-        """Persist refreshed token back to the SAME instance-local file (nested format)."""
+        """Persist refreshed token back to the SAME instance-local file (nested format).
+
+        The file belongs to the Antigravity CLI: preserve every field the
+        bridge does not own (top-level and inside "token") instead of
+        rewriting the file with only the fields it knows about.
+        """
         tf = self.token_file
         try:
             tf.parent.mkdir(parents=True, exist_ok=True)
-            # FIX 2026-10-05: server chạy UTC nhưng code cũ dùng time.localtime()
-            # rồi gắn cứng suffix +07:00 -> expiry trong file sai lệch 7 tiếng
-            # (trông như hết hạn dù token còn hạn). Ghi đúng giờ +07:00 thật.
+            payload: Dict[str, Any] = {}
+            if tf.is_file():
+                try:
+                    with open(tf, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    if isinstance(existing, dict):
+                        payload = existing
+                except Exception:
+                    payload = {}
+            # Write the expiry as a UTC instant. (An earlier version used
+            # localtime() with a hardcoded +07:00 suffix, shifting the
+            # stored expiry by the host's UTC offset.)
             import datetime as _dt
-            _tz7 = _dt.timezone(_dt.timedelta(hours=7))
-            _exp = _dt.datetime.fromtimestamp(creds.expires_at, tz=_tz7)
-            payload = {
-                "auth_method": "consumer",
-                "token": {
-                    "access_token": creds.access_token,
-                    "token_type": "Bearer",
-                    "refresh_token": creds.refresh_token,
-                    "expiry": _exp.strftime("%Y-%m-%dT%H:%M:%S.000000+07:00"),
-                },
-            }
+            _exp = _dt.datetime.fromtimestamp(creds.expires_at, tz=_dt.timezone.utc)
+            token_payload = payload.get("token")
+            if not isinstance(token_payload, dict):
+                token_payload = {}
+            token_payload.update({
+                "access_token": creds.access_token,
+                "token_type": "Bearer",
+                "refresh_token": creds.refresh_token,
+                "expiry": _exp.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00"),
+            })
+            payload["auth_method"] = payload.get("auth_method") or "consumer"
+            payload["token"] = token_payload
             tmp = tf.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -186,8 +218,19 @@ class AntigravityAuthManager:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=20.0) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=20.0) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # A 4xx from Google's token endpoint (e.g. 400 invalid_grant
+            # for a revoked refresh token) is an auth verdict, not a
+            # bridge crash: surface it as "unauthorized" so the HTTP
+            # layer answers 401 instead of a misleading 500.
+            if 400 <= e.code < 500:
+                raise RuntimeError("unauthorized") from e
+            raise RuntimeError(f"token refresh failed: HTTP {e.code}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"token refresh failed: {e.reason}") from e
         new_token = raw.get("access_token")
         if not new_token:
             raise RuntimeError(f"Token refresh failed: {raw}")
@@ -206,7 +249,9 @@ class AntigravityAuthManager:
         Raises RuntimeError("unauthorized") on bearer mismatch/empty — NO fallback.
         """
         with self._lock:
-            if not bearer_token or bearer_token != self.api_key:
+            if not bearer_token or not hmac.compare_digest(
+                str(bearer_token).encode("utf-8"), str(self.api_key).encode("utf-8")
+            ):
                 raise RuntimeError("unauthorized")
             creds = self._cached or self.load_instance_credentials()
             if not creds:

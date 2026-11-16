@@ -9,6 +9,7 @@ Implements:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -601,6 +602,36 @@ def build_code_assist_request(
 # Gemini to OpenAI Response Translation
 # =============================================================================
 
+def _map_finish_reason(gemini_reason: Any, has_tool_calls: bool) -> str:
+    """Map a Gemini finishReason to the OpenAI finish_reason vocabulary.
+
+    Truncation must surface as "length" (it used to be reported as a
+    normal "stop", so clients could not tell a cut-off answer from a
+    complete one), and safety blocks as "content_filter".
+    """
+    if has_tool_calls:
+        return "tool_calls"
+    return {
+        "STOP": "stop",
+        "MAX_TOKENS": "length",
+        "SAFETY": "content_filter",
+        "RECITATION": "content_filter",
+        "BLOCKLIST": "content_filter",
+        "PROHIBITED_CONTENT": "content_filter",
+    }.get(str(gemini_reason or "STOP").upper(), "stop")
+
+
+def _usage_from_metadata(inner: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Extract OpenAI-style usage from a Gemini usageMetadata block."""
+    meta = inner.get("usageMetadata")
+    if not isinstance(meta, dict):
+        return None
+    prompt = int(meta.get("promptTokenCount") or 0)
+    completion = int(meta.get("candidatesTokenCount") or 0)
+    total = int(meta.get("totalTokenCount") or (prompt + completion))
+    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total}
+
+
 def translate_gemini_to_openai_response(
     gemini_resp: Dict[str, Any],
     requested_model: str,
@@ -650,7 +681,8 @@ def translate_gemini_to_openai_response(
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    finish_reason = "tool_calls" if tool_calls else "stop"
+    cand_finish = candidates[0].get("finishReason") if candidates and isinstance(candidates[0], dict) else None
+    finish_reason = _map_finish_reason(cand_finish, bool(tool_calls))
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -664,7 +696,8 @@ def translate_gemini_to_openai_response(
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
+        # Real usage from upstream usageMetadata (used to be hardcoded 0).
+        "usage": _usage_from_metadata(inner) or {
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -723,15 +756,17 @@ def translate_gemini_stream_event(
     if tool_calls:
         delta["tool_calls"] = tool_calls
 
-    if not delta:
-        return None
-
     finish_reason = cand.get("finishReason")
-    openai_finish_reason = "stop" if finish_reason == "STOP" else None
-    if tool_calls:
+    openai_finish_reason = None
+    if finish_reason:
+        openai_finish_reason = _map_finish_reason(finish_reason, bool(tool_calls))
+    elif tool_calls:
         openai_finish_reason = "tool_calls"
 
-    return {
+    if not delta and openai_finish_reason is None:
+        return None
+
+    chunk: Dict[str, Any] = {
         "id": stream_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
@@ -744,13 +779,30 @@ def translate_gemini_stream_event(
             }
         ],
     }
+    usage = _usage_from_metadata(inner)
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
 
 
 class AntigravityClient:
     """HTTP Client executing requests against Google Code Assist backend."""
 
-    def __init__(self, auth_manager: Optional[AntigravityAuthManager] = None) -> None:
-        self.auth_manager = auth_manager or AntigravityAuthManager()
+    def __init__(
+        self,
+        auth_manager: Optional[AntigravityAuthManager] = None,
+        *,
+        api_key: Optional[str] = None,
+        home: Optional[Any] = None,
+    ) -> None:
+        if auth_manager is None:
+            if not api_key:
+                raise ValueError(
+                    "AntigravityClient requires an auth_manager or an api_key; "
+                    "constructing it with neither cannot authenticate any request."
+                )
+            auth_manager = AntigravityAuthManager(api_key=api_key, home=home)
+        self.auth_manager = auth_manager
         self._http = httpx.AsyncClient(timeout=300.0)
 
     async def close(self) -> None:
@@ -762,7 +814,11 @@ class AntigravityClient:
         bearer_token: str = "",
     ) -> Dict[str, Any]:
         """Execute a non-streaming chat completion."""
-        creds = self.auth_manager.resolve_valid_credentials(bearer_token=bearer_token)
+        # resolve_valid_credentials may perform a blocking token refresh
+        # (up to ~20s of synchronous HTTP); keep it off the event loop.
+        creds = await asyncio.to_thread(
+            self.auth_manager.resolve_valid_credentials, bearer_token=bearer_token
+        )
         envelope = build_code_assist_request(openai_payload, creds.project_id)
         headers = build_antigravity_headers(creds.access_token, creds.project_id)
 
@@ -791,7 +847,9 @@ class AntigravityClient:
         bearer_token: str = "",
     ) -> AsyncIterator[str]:
         """Stream chat completion as Server-Sent Events (SSE)."""
-        creds = self.auth_manager.resolve_valid_credentials(bearer_token=bearer_token)
+        creds = await asyncio.to_thread(
+            self.auth_manager.resolve_valid_credentials, bearer_token=bearer_token
+        )
         envelope = build_code_assist_request(openai_payload, creds.project_id)
         headers = build_antigravity_headers(creds.access_token, creds.project_id)
         headers["Accept"] = "text/event-stream"
@@ -821,6 +879,8 @@ class AntigravityClient:
             yield f"data: {json.dumps(initial_chunk)}\n\n"
 
             buffer = ""
+            last_finish_reason: Optional[str] = None
+            last_usage: Optional[Dict[str, int]] = None
             async for raw_chunk in response.aiter_text():
                 # Normalize line endings: Google Code Assist SSE uses \r\r\n instead of \n\n
                 buffer += raw_chunk.replace("\r\n", "\n").replace("\r", "\n")
@@ -838,17 +898,26 @@ class AntigravityClient:
                                     event_obj, requested_model, stream_id
                                 )
                                 if chunk:
+                                    fr = chunk["choices"][0].get("finish_reason")
+                                    if fr:
+                                        last_finish_reason = fr
+                                    if chunk.get("usage"):
+                                        last_usage = chunk["usage"]
                                     yield f"data: {json.dumps(chunk)}\n\n"
                             except Exception as e:
                                 logger.debug("Failed to parse SSE event: %s", e)
 
-        # Final end chunk
-        final_chunk = {
+        # Final end chunk: report the finish reason the upstream actually
+        # ended with (used to unconditionally claim "stop", overriding an
+        # earlier "tool_calls"/"length"), plus the real usage when known.
+        final_chunk: Dict[str, Any] = {
             "id": stream_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": requested_model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish_reason or "stop"}],
         }
+        if last_usage is not None:
+            final_chunk["usage"] = last_usage
         yield f"data: {json.dumps(final_chunk)}\n\n"
         yield "data: [DONE]\n\n"
