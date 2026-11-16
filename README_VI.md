@@ -75,9 +75,42 @@ Model nào dùng được còn tùy quyền lợi của tài khoản Antigravity
 
 - Python 3.10+
 - **Antigravity CLI** (`agy`), đã đăng nhập ít nhất một lần — bridge dùng
-  lại file OAuth token mà CLI ghi ra. (Cài Antigravity tại
-  <https://antigravity.google>.)
+  lại file OAuth token mà CLI ghi ra. Nếu chưa có, xem mục ngay dưới đây.
 - `pip install -r requirements.txt`
+
+## Cài đặt Antigravity CLI (`agy`)
+
+Bridge không tự đăng nhập Google — nó dùng lại OAuth token mà Antigravity
+CLI chính thức ghi ra sau khi bạn đăng nhập. Hãy cài CLI trước:
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+```
+
+Trình cài đặt đặt `agy` vào `~/.local/bin` (dùng `--dir <path>` nếu muốn
+đổi vị trí). Hãy chắc chắn thư mục đó nằm trong `PATH`, rồi mở lại terminal.
+
+**Windows**
+
+Tải trình cài đặt PowerShell chính thức tại
+<https://antigravity.google/cli/install.ps1> và chạy trong PowerShell, hoặc
+tải Antigravity tại <https://antigravity.google>. Sau đó mở lại terminal để
+`agy` có mặt trong `PATH`.
+
+**Kiểm tra cài đặt và đăng nhập**
+
+```bash
+agy --version        # phải in ra phiên bản, ví dụ 1.3.x
+agy -p "hi"          # lần chạy đầu sẽ mở trình duyệt để đăng nhập Google
+```
+
+Đăng nhập xong, OAuth token được lưu tại
+`~/.gemini/antigravity-cli/antigravity-oauth-token`
+(trên Windows: `%USERPROFILE%\.gemini\antigravity-cli\antigravity-oauth-token`).
+File này là thông tin đăng nhập duy nhất bridge cần — bridge đọc nó từ
+`HOME` của instance mà nó chạy, và tự động làm mới khi sắp hết hạn.
 
 ## Bắt đầu nhanh — một instance
 

@@ -74,9 +74,44 @@ Availability depends on what your Antigravity account is entitled to.
 
 - Python 3.10+
 - The **Antigravity CLI** (`agy`), logged in at least once — the bridge reuses
-  the OAuth token file the CLI writes. (Install Antigravity from
-  <https://antigravity.google>.)
+  the OAuth token file the CLI writes. See the next section if you don't
+  have it yet.
 - `pip install -r requirements.txt`
+
+## Installing the Antigravity CLI (`agy`)
+
+The bridge does not log in to Google itself — it reuses the OAuth token that
+the official Antigravity CLI writes after you log in. Install the CLI first:
+
+**macOS / Linux**
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+```
+
+The installer places `agy` in `~/.local/bin` (use `--dir <path>` for a custom
+location). Make sure that directory is on your `PATH`, then restart your
+terminal.
+
+**Windows**
+
+Download the official PowerShell installer from
+<https://antigravity.google/cli/install.ps1> and run it in PowerShell, or get
+Antigravity from <https://antigravity.google>. Restart your terminal
+afterwards so `agy` is on your `PATH`.
+
+**Verify the install and log in**
+
+```bash
+agy --version        # should print a version, e.g. 1.3.x
+agy -p "hi"          # first run opens a browser for Google sign-in
+```
+
+Signing in saves your OAuth token to
+`~/.gemini/antigravity-cli/antigravity-oauth-token`
+(on Windows: `%USERPROFILE%\.gemini\antigravity-cli\antigravity-oauth-token`).
+That file is the only credential the bridge needs — it reads it from the
+`HOME` of the instance it runs as, and refreshes it automatically.
 
 ## Quick start — single instance
 
