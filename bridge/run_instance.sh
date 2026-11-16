@@ -7,13 +7,15 @@
 # No secrets live in this file.
 #
 # Usage: run_instance.sh <account> [port]
-#   account  e.g. oauth1 (a subdirectory of $HAGI_ACCOUNTS_DIR, a key in keys.json)
+#   account  e.g. oauth1 (a subdirectory of $ANTIGRAVITY_BRIDGE_ACCOUNTS_DIR,
+#            a key in keys.json; legacy spelling $HAGI_ACCOUNTS_DIR also works)
 #   port     default: 8100 + the numeric suffix of the account (oauth1 -> 8101)
 #
 # Environment overrides:
-#   HAGI_ACCOUNTS_DIR      default: ~/.local/share/antigravity-bridge-accounts
-#   HAGI_BRIDGE_BIND_HOST  default: 127.0.0.1
-#   PYTHON_BIN             default: repo .venv, else python3
+#   ANTIGRAVITY_BRIDGE_ACCOUNTS_DIR  default: ~/.local/share/antigravity-bridge-accounts
+#   ANTIGRAVITY_BRIDGE_BIND_HOST     default: 127.0.0.1
+#   PYTHON_BIN                       default: repo .venv, else python3
+# The legacy HAGI_* spellings are still honoured as fallbacks.
 set -euo pipefail
 
 ACCOUNT="${1:-}"
@@ -21,12 +23,18 @@ if [[ -z "$ACCOUNT" ]]; then
   echo "usage: run_instance.sh <account> [port]" >&2
   exit 2
 fi
+# The account name becomes a directory path: only a safe charset is
+# allowed, and path traversal is rejected outright.
+if [[ ! "$ACCOUNT" =~ ^[A-Za-z0-9._-]+$ || "$ACCOUNT" == *".."* ]]; then
+  echo "ERROR: unsafe account name '$ACCOUNT'" >&2
+  exit 1
+fi
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEYS_FILE="$REPO_DIR/bridge/keys.json"
-ACCOUNTS_DIR="${HAGI_ACCOUNTS_DIR:-$HOME/.local/share/antigravity-bridge-accounts}"
+ACCOUNTS_DIR="${ANTIGRAVITY_BRIDGE_ACCOUNTS_DIR:-${HAGI_ACCOUNTS_DIR:-$HOME/.local/share/antigravity-bridge-accounts}}"
 HOME_DIR="$ACCOUNTS_DIR/$ACCOUNT"
-BIND_HOST="${HAGI_BRIDGE_BIND_HOST:-127.0.0.1}"
+BIND_HOST="${ANTIGRAVITY_BRIDGE_BIND_HOST:-${HAGI_BRIDGE_BIND_HOST:-127.0.0.1}}"
 
 if [[ -n "${2:-}" ]]; then
   PORT="$2"

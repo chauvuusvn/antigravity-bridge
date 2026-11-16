@@ -10,11 +10,13 @@ Implements:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
 import time
+import urllib.request
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -233,6 +235,31 @@ def _coerce_content_to_text(content: Any) -> str:
     return str(content)
 
 
+_MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _fetch_remote_image(url: str) -> Optional[Dict[str, Any]]:
+    """Download an http(s) image and return a Gemini inlineData part.
+
+    OpenAI clients may reference images by URL; Gemini Code Assist only
+    accepts inline bytes. The download is size-capped and timed out, and
+    any failure returns None so the caller can leave an explicit marker
+    instead of silently dropping the image (the old behaviour).
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "antigravity-bridge/2"})
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            mime = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+            data = resp.read(_MAX_REMOTE_IMAGE_BYTES + 1)
+        if len(data) > _MAX_REMOTE_IMAGE_BYTES:
+            logger.warning("Remote image too large, skipped: %s", url)
+            return None
+        return {"inlineData": {"mimeType": mime, "data": base64.b64encode(data).decode("ascii")}}
+    except Exception as e:
+        logger.warning("Failed to fetch remote image %s: %s", url, e)
+        return None
+
+
 def _coerce_content_to_parts(content: Any) -> List[Dict[str, Any]]:
     """Convert OpenAI/Anthropic/Gemini multimodal content to Gemini parts format.
 
@@ -269,6 +296,12 @@ def _coerce_content_to_parts(content: Any) -> List[Dict[str, Any]]:
                             })
                         except Exception:
                             pass
+                    elif isinstance(url, str) and url.startswith(("http://", "https://")):
+                        fetched = _fetch_remote_image(url)
+                        if fetched is not None:
+                            parts.append(fetched)
+                        else:
+                            parts.append({"text": f"[image could not be fetched: {url}]"})
                 elif ptype == "image" and isinstance(part.get("source"), dict):
                     src = part["source"]
                     if src.get("type") == "base64" and src.get("data"):
@@ -343,10 +376,17 @@ def _translate_tool_result_to_gemini(message: Dict[str, Any]) -> Dict[str, Any]:
 def _sanitize_schema_for_code_assist(schema: Any) -> Any:
     """Return a Gemini Code Assist-compatible subset of a JSON schema.
 
-    Some clients forward OpenAI tool schemas that may contain JSON Schema features
-    rejected by Code Assist (for example ``const``, ``default``, and
-    ``additionalProperties``) or union types (``anyOf``/``oneOf``) that cause
-    Claude on Vertex/Antigravity to fail JSON Schema draft 2020-12 validation.
+    Some clients forward OpenAI tool schemas that may contain JSON Schema
+    features rejected by Code Assist (for example ``const``, ``default``,
+    and ``additionalProperties``) or union types (``anyOf``/``oneOf``)
+    that cause Claude on Vertex/Antigravity to fail JSON Schema draft
+    2020-12 validation.
+
+    Union handling: the first branch that carries a type is merged in and
+    the union keys are dropped — at ANY nesting level, not just inside
+    ``properties``. A ``type`` given as a list (e.g. ["integer", "null"])
+    is normalised to the non-null type plus ``nullable: true``; Gemini
+    rejects list-valued types.
     """
     if isinstance(schema, list):
         return [_sanitize_schema_for_code_assist(item) for item in schema]
@@ -362,37 +402,46 @@ def _sanitize_schema_for_code_assist(schema: Any) -> Any:
         "$schema",
         "$id",
     }
+    union_keys = {"oneOf", "anyOf", "allOf"}
+
     sanitized: Dict[str, Any] = {}
+
+    # Merge the first usable union branch (its keys lose to explicit ones).
+    for union_k in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(union_k)
+        if isinstance(branches, list):
+            for branch in branches:
+                if isinstance(branch, dict) and (
+                    "type" in branch or "properties" in branch or "items" in branch
+                ):
+                    branch_clean = _sanitize_schema_for_code_assist(branch)
+                    for bk, bv in branch_clean.items():
+                        sanitized.setdefault(bk, bv)
+                    break
+            break
+
     for key, value in schema.items():
-        if key in drop_keys:
+        if key in drop_keys or key in union_keys:
             continue
-        # Drop union keys directly to prevent malformed schema translation on Claude
-        if key in {"oneOf", "anyOf", "allOf"}:
+        if key == "type" and isinstance(value, list):
+            types = [x for x in value if isinstance(x, str)]
+            non_null = [x for x in types if x != "null"]
+            if non_null:
+                sanitized["type"] = non_null[0]
+            if "null" in types:
+                sanitized["nullable"] = True
             continue
         if key in {"properties", "patternProperties"} and isinstance(value, dict):
             new_props: Dict[str, Any] = {}
             for prop_name, prop_schema in value.items():
                 if isinstance(prop_schema, dict):
                     prop_clean = _sanitize_schema_for_code_assist(prop_schema)
-                    # If property lacks a top-level type (e.g. from anyOf), infer from first union branch
-                    if "type" not in prop_clean:
-                        for union_k in ["anyOf", "oneOf", "allOf"]:
-                            if union_k in prop_schema and isinstance(prop_schema[union_k], list):
-                                for branch in prop_schema[union_k]:
-                                    if isinstance(branch, dict) and "type" in branch:
-                                        prop_clean["type"] = branch["type"]
-                                        if "items" in branch:
-                                            prop_clean["items"] = _sanitize_schema_for_code_assist(branch["items"])
-                                        break
-                                if "type" in prop_clean:
-                                    break
-                        if "type" not in prop_clean:
-                            prop_clean["type"] = "string"
+                    if "type" not in prop_clean and "properties" not in prop_clean:
+                        prop_clean["type"] = "string"
                     new_props[str(prop_name)] = prop_clean
+                else:
+                    new_props[str(prop_name)] = prop_schema
             sanitized[key] = new_props
-            continue
-        if key == "items":
-            sanitized[key] = _sanitize_schema_for_code_assist(value)
             continue
         sanitized[key] = _sanitize_schema_for_code_assist(value)
     return sanitized
@@ -462,7 +511,9 @@ def build_code_assist_request(
             continue
         role = str(msg.get("role") or "user")
 
-        if role == "system":
+        if role in {"system", "developer"}:
+            # OpenAI's "developer" role is the system tier under another
+            # name; it belongs in systemInstruction, not in a user turn.
             text = _coerce_content_to_text(msg.get("content"))
             if text:
                 system_text_parts.append(text)
@@ -527,8 +578,10 @@ def build_code_assist_request(
     joined_system = "\n".join(p for p in system_text_parts if p).strip()
 
     if not contents:
-        fallback_text = joined_system or "Hello"
-        contents.append({"role": "user", "parts": [{"text": fallback_text}]})
+        # Use a neutral placeholder only: the system text (if any) is
+        # already delivered via systemInstruction below, and copying it
+        # here as a fake user message duplicated it in every request.
+        contents.append({"role": "user", "parts": [{"text": "Hello"}]})
 
     # Gemini requires strict role alternation (user/model/user/model...).
     # Long OpenAI conversations can produce consecutive same-role messages
@@ -569,6 +622,25 @@ def build_code_assist_request(
         max_output_tokens = MIN_MAX_OUTPUT_TOKENS
     if max_output_tokens is not None:
         generation_config["maxOutputTokens"] = max_output_tokens
+    stop = openai_payload.get("stop")
+    if stop:
+        generation_config["stopSequences"] = [stop] if isinstance(stop, str) else [str(s) for s in stop]
+    if openai_payload.get("top_k") is not None:
+        generation_config["topK"] = int(openai_payload["top_k"])
+    if openai_payload.get("seed") is not None:
+        generation_config["seed"] = int(openai_payload["seed"])
+    response_format = openai_payload.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") in ("json_object", "json_schema"):
+        generation_config["responseMimeType"] = "application/json"
+        if response_format.get("type") == "json_schema":
+            schema = (response_format.get("json_schema") or {}).get("schema")
+            if isinstance(schema, dict):
+                generation_config["responseSchema"] = _sanitize_schema_for_code_assist(schema)
+    for penalty_key in ("frequency_penalty", "presence_penalty"):
+        if openai_payload.get(penalty_key):
+            # Gemini has no equivalent knob; say so instead of silently
+            # pretending the parameter was honoured.
+            logger.warning("OpenAI parameter %s has no Gemini equivalent and is ignored", penalty_key)
 
     inner_request: Dict[str, Any] = {
         "contents": contents,
@@ -823,7 +895,10 @@ class AntigravityClient:
         headers = build_antigravity_headers(creds.access_token, creds.project_id)
 
         url = f"{CODE_ASSIST_BASE_URL}:generateContent"
-        resp = await self._http.post(url, json=envelope, headers=headers)
+        try:
+            resp = await self._http.post(url, json=envelope, headers=headers)
+        except httpx.HTTPError as e:
+            raise CodeAssistError(502, f"upstream transport error: {e}") from e
         if resp.status_code != 200:
             # Only an endpoint-level 5xx justifies trying the fallback host.
             # A 4xx (429 quota exhausted, 403 account disabled, 400 bad
@@ -833,11 +908,17 @@ class AntigravityClient:
                 raise CodeAssistError(resp.status_code, resp.text)
             logger.warning("Primary Code Assist endpoint returned %s, trying fallback", resp.status_code)
             fallback_url = f"{FALLBACK_CODE_ASSIST_BASE_URL}:generateContent"
-            resp = await self._http.post(fallback_url, json=envelope, headers=headers)
+            try:
+                resp = await self._http.post(fallback_url, json=envelope, headers=headers)
+            except httpx.HTTPError as e:
+                raise CodeAssistError(502, f"upstream transport error: {e}") from e
             if resp.status_code != 200:
                 raise CodeAssistError(resp.status_code, resp.text)
 
-        gemini_data = resp.json()
+        try:
+            gemini_data = resp.json()
+        except ValueError as e:
+            raise CodeAssistError(502, "upstream returned a non-JSON response") from e
         requested_model = openai_payload.get("model") or "gemini-3.7-flash"
         return translate_gemini_to_openai_response(gemini_data, requested_model)
 
@@ -857,55 +938,83 @@ class AntigravityClient:
         stream_id = f"chatcmpl-{uuid.uuid4().hex}"
         requested_model = openai_payload.get("model") or "gemini-3.7-flash"
 
-        url = f"{CODE_ASSIST_BASE_URL}:streamGenerateContent?alt=sse"
+        attempt_urls = [
+            f"{CODE_ASSIST_BASE_URL}:streamGenerateContent?alt=sse",
+            f"{FALLBACK_CODE_ASSIST_BASE_URL}:streamGenerateContent?alt=sse",
+        ]
+        last_finish_reason: Optional[str] = None
+        last_usage: Optional[Dict[str, int]] = None
 
-        async with self._http.stream("POST", url, json=envelope, headers=headers) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                raise CodeAssistError(
-                    response.status_code,
-                    body.decode("utf-8", "replace"),
-                    streaming=True,
-                )
+        for attempt_idx, attempt_url in enumerate(attempt_urls):
+            yielded_any = False
+            retry = False
+            try:
+                async with self._http.stream("POST", attempt_url, json=envelope, headers=headers) as response:
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        # Same rule as the non-streaming path: only a 5xx
+                        # justifies the fallback host; a 4xx is a verdict.
+                        if response.status_code >= 500 and attempt_idx == 0:
+                            logger.warning(
+                                "Primary stream endpoint returned %s, trying fallback",
+                                response.status_code,
+                            )
+                            retry = True
+                        else:
+                            raise CodeAssistError(
+                                response.status_code,
+                                body.decode("utf-8", "replace"),
+                                streaming=True,
+                            )
+                    if retry:
+                        continue
 
-            # Emit initial chunk with role once connection is verified
-            initial_chunk = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": requested_model,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(initial_chunk)}\n\n"
+                    # Emit initial chunk with role once connection is verified
+                    initial_chunk = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": requested_model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(initial_chunk)}\n\n"
+                    yielded_any = True
 
-            buffer = ""
-            last_finish_reason: Optional[str] = None
-            last_usage: Optional[Dict[str, int]] = None
-            async for raw_chunk in response.aiter_text():
-                # Normalize line endings: Google Code Assist SSE uses \r\r\n instead of \n\n
-                buffer += raw_chunk.replace("\r\n", "\n").replace("\r", "\n")
-                while "\n\n" in buffer:
-                    event_block, buffer = buffer.split("\n\n", 1)
-                    for line in event_block.split("\n"):
-                        line = line.strip()
-                        if line.startswith("data:"):
-                            raw_json = line[5:].strip()
-                            if not raw_json or raw_json == "[DONE]":
-                                continue
-                            try:
-                                event_obj = json.loads(raw_json)
-                                chunk = translate_gemini_stream_event(
-                                    event_obj, requested_model, stream_id
-                                )
-                                if chunk:
-                                    fr = chunk["choices"][0].get("finish_reason")
-                                    if fr:
-                                        last_finish_reason = fr
-                                    if chunk.get("usage"):
-                                        last_usage = chunk["usage"]
-                                    yield f"data: {json.dumps(chunk)}\n\n"
-                            except Exception as e:
-                                logger.debug("Failed to parse SSE event: %s", e)
+                    buffer = ""
+                    async for raw_chunk in response.aiter_text():
+                        # Normalize line endings: Google Code Assist SSE uses \r\r\n instead of \n\n
+                        buffer += raw_chunk.replace("\r\n", "\n").replace("\r", "\n")
+                        while "\n\n" in buffer:
+                            event_block, buffer = buffer.split("\n\n", 1)
+                            for line in event_block.split("\n"):
+                                line = line.strip()
+                                if line.startswith("data:"):
+                                    raw_json = line[5:].strip()
+                                    if not raw_json or raw_json == "[DONE]":
+                                        continue
+                                    try:
+                                        event_obj = json.loads(raw_json)
+                                        chunk = translate_gemini_stream_event(
+                                            event_obj, requested_model, stream_id
+                                        )
+                                        if chunk:
+                                            fr = chunk["choices"][0].get("finish_reason")
+                                            if fr:
+                                                last_finish_reason = fr
+                                            if chunk.get("usage"):
+                                                last_usage = chunk["usage"]
+                                            yield f"data: {json.dumps(chunk)}\n\n"
+                                    except Exception as e:
+                                        logger.debug("Failed to parse SSE event: %s", e)
+            except httpx.HTTPError as e:
+                # Transport failure before any byte reached the client may
+                # retry on the fallback host; after partial delivery it
+                # must surface as an error, never a duplicated restart.
+                if attempt_idx == 0 and not yielded_any:
+                    logger.warning("Primary stream transport error %s, trying fallback", e)
+                    continue
+                raise CodeAssistError(502, f"upstream transport error: {e}", streaming=True) from e
+            break
 
         # Final end chunk: report the finish reason the upstream actually
         # ended with (used to unconditionally claim "stop", overriding an

@@ -30,8 +30,18 @@ REFRESH_SKEW_SECONDS = 120
 TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 # Public client credentials from the Antigravity OAuth plugin (consumer tier).
-DEFAULT_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-DEFAULT_CLIENT_SECRET = "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"
+# These are the public OAuth client credentials of the Antigravity CLI
+# itself (every agy install ships them; they identify the app, not a
+# user). They can be overridden via the environment, e.g. to keep source
+# scanners quiet or to use a different registered client.
+DEFAULT_CLIENT_ID = os.environ.get(
+    "ANTIGRAVITY_OAUTH_CLIENT_ID",
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+)
+DEFAULT_CLIENT_SECRET = os.environ.get(
+    "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+    "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",
+)
 DEFAULT_PROJECT_ID = "aicode-consumers"
 
 # agy stores the OAuth token here, relative to the instance HOME.
@@ -107,7 +117,7 @@ class AntigravityAuthManager:
     """Instance-local auth: one account, one HOME, auto-refresh, no replication.
 
     api_key: per-instance bridge API key the HTTP client must present.
-    home: the instance HOME directory (e.g. .../hagi-oauth-accounts/oauth1).
+    home: the instance HOME directory (e.g. .../antigravity-bridge-accounts/oauth1).
     """
 
     def __init__(self, api_key: str, home: Optional[Path] = None) -> None:

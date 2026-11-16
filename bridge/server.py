@@ -63,12 +63,20 @@ class AntigravityBridgeServer:
         self._setup_routes()
 
     def _setup_routes(self) -> None:
+        self.app.on_cleanup.append(self._on_cleanup)
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/v1/models", self.handle_list_models)
         self.app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         # Anthropic Messages API routes for Claude Code CLI
         self.app.router.add_post("/v1/messages", self.handle_anthropic_messages)
         self.app.router.add_post("/messages", self.handle_anthropic_messages)
+
+    async def _on_cleanup(self, app: web.Application) -> None:
+        """Release the upstream HTTP connection pool on shutdown."""
+        try:
+            await self.client.close()
+        except Exception:
+            pass
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({
@@ -322,7 +330,7 @@ def main() -> None:
     p.add_argument("--port", type=int, default=DEFAULT_BRIDGE_PORT)
     p.add_argument("--api-key", default="", help="Bearer key (prefer --api-key-env)")
     p.add_argument("--api-key-env", default="ANTIGRAVITY_BRIDGE_API_KEY")
-    p.add_argument("--home", required=True, help="Instance HOME dir (hagi-oauth account)")
+    p.add_argument("--home", required=True, help="Instance HOME dir (per-account home)")
     args = p.parse_args()
 
     api_key = args.api_key or os.environ.get(args.api_key_env, "")

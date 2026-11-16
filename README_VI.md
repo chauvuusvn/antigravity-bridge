@@ -165,8 +165,8 @@ việc khác nhau không nên dùng chung quota của một tài khoản.
 
    Theo quy ước, tài khoản `oauthN` được phục vụ ở cổng `8100 + N`
    (`oauth1` → 8101, `oauth2` → 8102, …). Có thể đổi bằng các biến môi
-   trường ghi ở đầu file `bridge/launch_all.sh` (`HAGI_ACCOUNTS_DIR`,
-   `HAGI_BASE_PORT`, `HAGI_BRIDGE_BIND_HOST`, `PYTHON_BIN`).
+   trường ghi ở đầu file `bridge/launch_all.sh` (`ANTIGRAVITY_BRIDGE_ACCOUNTS_DIR`,
+   `ANTIGRAVITY_BRIDGE_BASE_PORT`, `ANTIGRAVITY_BRIDGE_BIND_HOST`, `PYTHON_BIN`).
 
 4. Hoặc chạy một instance ở foreground (cũng là entry point mà template
    systemd sử dụng):

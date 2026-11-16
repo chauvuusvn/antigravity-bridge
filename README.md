@@ -167,7 +167,7 @@ workloads should not share one account's quota.
    By convention account `oauthN` is served on port `8100 + N`
    (`oauth1` → 8101, `oauth2` → 8102, …). Override with the environment
    variables documented at the top of `bridge/launch_all.sh`
-   (`HAGI_ACCOUNTS_DIR`, `HAGI_BASE_PORT`, `HAGI_BRIDGE_BIND_HOST`,
+   (`ANTIGRAVITY_BRIDGE_ACCOUNTS_DIR`, `ANTIGRAVITY_BRIDGE_BASE_PORT`, `ANTIGRAVITY_BRIDGE_BIND_HOST`,
    `PYTHON_BIN`).
 
 4. Or run a single instance in the foreground (also the entry point used by
