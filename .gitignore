@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+# Per-instance bridge API keys (secrets — never commit)
+bridge/keys.json
+# Local log files
+bridge/*.log
+.pytest_cache/
+*.lock
+*.bak
+.venv/

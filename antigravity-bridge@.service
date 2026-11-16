@@ -1,0 +1,26 @@
+[Unit]
+Description=Antigravity OAuth Bridge (instance %i)
+After=network-online.target
+Wants=network-online.target
+
+# Install as a systemd --user template unit:
+#   mkdir -p ~/.config/systemd/user
+#   cp antigravity-bridge@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now antigravity-bridge@oauth1
+#
+# One unit per account. The instance name (%i, e.g. "oauth1") must match a
+# directory under $HAGI_ACCOUNTS_DIR and a key in bridge/keys.json.
+# Adjust the WorkingDirectory path below to your clone location.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/antigravity-bridge
+ExecStart=%h/antigravity-bridge/bridge/run_instance.sh %i
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
