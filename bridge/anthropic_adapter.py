@@ -1,4 +1,4 @@
-"""Anthropic Messages API to OpenAI / Gemini Code Assist adapter for Hagi Bridge."""
+"""Anthropic Messages API to OpenAI / Gemini Code Assist adapter."""
 
 from __future__ import annotations
 
@@ -9,6 +9,31 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def map_anthropic_model(requested: Any) -> str:
+    """Map an Anthropic-side model name to a bridge model ID.
+
+    The requested model must be honoured: previously this adapter ignored
+    it and hardcoded gemini-3.8-flash, so a client asking for Claude was
+    silently served by Gemini while the response claimed to be Claude.
+
+    Claude-family names (any version/date suffix) map to the bridge's
+    Claude entries; anything else (Gemini/GPT-OSS bridge IDs, aliases) is
+    passed through for the bridge's own alias resolution.
+    """
+    name = str(requested or "").strip()
+    if not name:
+        return "gemini-3.8-flash"
+    low = name.lower()
+    if low.startswith("claude") or "claude" in low:
+        if "opus" in low:
+            return "claude-opus-4-6"
+        if "haiku" in low:
+            logger.warning("No Haiku model upstream; serving %s with claude-sonnet-4-6", name)
+            return "claude-sonnet-4-6"
+        return "claude-sonnet-4-6"
+    return name
 
 
 def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -99,7 +124,7 @@ def translate_anthropic_payload_to_openai(payload: Dict[str, Any]) -> Dict[str, 
         })
 
     openai_payload: Dict[str, Any] = {
-        "model": "gemini-3.8-flash",
+        "model": map_anthropic_model(payload.get("model")),
         "messages": messages,
         "stream": bool(payload.get("stream", False)),
     }

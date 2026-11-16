@@ -80,10 +80,14 @@ def _parse_expiry(value) -> float:
     # ISO format: 2026-08-31T15:20:56.074422314+07:00
     try:
         import datetime
-        # Python 3.11+ handles Z; for +07:00 fromisoformat works directly.
         dt = datetime.datetime.fromisoformat(s)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        if dt.tzinfo is None:
+            # A naive timestamp from agy is UTC. Interpreting it in the
+            # host's local timezone (the old behaviour) shifted the epoch
+            # by the local UTC offset (e.g. -7h in Asia/Ho_Chi_Minh, +5h
+            # in US Eastern), corrupting every expiry decision.
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        # An aware datetime's .timestamp() is the correct epoch on any host.
         return dt.timestamp()
     except Exception:
         return 0.0

@@ -53,20 +53,21 @@ in `bridge/client.py`):
 
 | Model ID | Display name |
 |---|---|
-| `gemini-4-argon` | Gemini 4 Argon (Thinking) |
-| `argon` | Gemini 4 Argon |
 | `gemini-3.8-flash` | Gemini 3.8 Flash (Tiered Thinking) |
 | `gemini-3.8-flash-tiered` | Gemini 3.8 Flash Tiered (Thinking) |
 | `gemini-3.8-flash-high` | Gemini 3.8 Flash High |
 | `gemini-3.8-flash-medium` | Gemini 3.8 Flash Medium |
 | `gemini-3.8-flash-low` | Gemini 3.8 Flash Low |
-| `gemini-3.7-flash` | Gemini 3.7 Flash High |
-| `gemini-3.7-flash-high` | Gemini 3.7 Flash High |
-| `gemini-3.6-flash` | Gemini 3.6 Flash Medium |
-| `gemini-3.1-pro` | Gemini 3.1 Pro Low |
+| `gemini-3.7-flash` | Gemini 3.7 Flash (served by Gemini 3.8 Flash tiered) |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) |
-| `claude-opus-4-6` | Claude Opus 4.6 (Thinking) |
-| `gpt-oss-120b` | GPT-OSS 120B (Medium) |
+| `claude-opus-4-6` | Claude Opus 4.6 (served by Claude Sonnet 4.6) |
+| `gpt-oss-120b` | GPT-OSS 120B (served by Gemini 3.8 Flash tiered) |
+
+Only models verified to exist upstream are advertised. Names that Google
+has removed from Code Assist (Gemini 4 Argon, Gemini 3.7 Flash High,
+Gemini 3.6 Flash, Gemini 3.1 Pro — all returned 404 in live testing) are
+no longer listed; requests using those legacy names fall back to
+`gemini-3.8-flash-tiered` with a warning in the bridge log.
 
 Availability depends on what your Antigravity account is entitled to.
 

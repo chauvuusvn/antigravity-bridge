@@ -54,20 +54,21 @@ tương ứng trong `bridge/client.py`):
 
 | Model ID | Tên hiển thị |
 |---|---|
-| `gemini-4-argon` | Gemini 4 Argon (Thinking) |
-| `argon` | Gemini 4 Argon |
 | `gemini-3.8-flash` | Gemini 3.8 Flash (Tiered Thinking) |
 | `gemini-3.8-flash-tiered` | Gemini 3.8 Flash Tiered (Thinking) |
 | `gemini-3.8-flash-high` | Gemini 3.8 Flash High |
 | `gemini-3.8-flash-medium` | Gemini 3.8 Flash Medium |
 | `gemini-3.8-flash-low` | Gemini 3.8 Flash Low |
-| `gemini-3.7-flash` | Gemini 3.7 Flash High |
-| `gemini-3.7-flash-high` | Gemini 3.7 Flash High |
-| `gemini-3.6-flash` | Gemini 3.6 Flash Medium |
-| `gemini-3.1-pro` | Gemini 3.1 Pro Low |
+| `gemini-3.7-flash` | Gemini 3.7 Flash (do Gemini 3.8 Flash tiered phục vụ) |
 | `claude-sonnet-4-6` | Claude Sonnet 4.6 (Thinking) |
-| `claude-opus-4-6` | Claude Opus 4.6 (Thinking) |
-| `gpt-oss-120b` | GPT-OSS 120B (Medium) |
+| `claude-opus-4-6` | Claude Opus 4.6 (do Claude Sonnet 4.6 phục vụ) |
+| `gpt-oss-120b` | GPT-OSS 120B (do Gemini 3.8 Flash tiered phục vụ) |
+
+Chỉ những model đã kiểm chứng còn tồn tại ở upstream mới được liệt kê.
+Các tên Google đã gỡ khỏi Code Assist (Gemini 4 Argon, Gemini 3.7 Flash
+High, Gemini 3.6 Flash, Gemini 3.1 Pro — đều trả 404 khi đo live) không
+còn trong bảng; request dùng các tên cũ đó sẽ fallback về
+`gemini-3.8-flash-tiered` kèm cảnh báo trong log của bridge.
 
 Model nào dùng được còn tùy quyền lợi của tài khoản Antigravity của bạn.
 

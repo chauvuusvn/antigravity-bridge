@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 # budget yields HTTP 200 with empty content. 1024 is verified safe upstream.
 MIN_MAX_OUTPUT_TOKENS = 1024
 
+# Safety cap for a single tool result forwarded upstream. Generous enough
+# for normal agent outputs (file reads, command logs); anything beyond it
+# is truncated WITH an explicit marker, never silently.
+TOOL_RESULT_MAX_CHARS = 100_000
+
 
 class CodeAssistError(RuntimeError):
     """Upstream Code Assist failure carrying the real HTTP status code.
@@ -59,20 +64,12 @@ class CodeAssistError(RuntimeError):
 CODE_ASSIST_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
 FALLBACK_CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com/v1internal"
 
-# Supported model catalogue (matching Antigravity IDE)
+# Supported model catalogue. Every entry's code_assist_model MUST equal
+# map_model_name(entry id) — a consistency test enforces this. Only models
+# verified to exist upstream are advertised: gemini-4-argon, gemini-3.7-flash-high,
+# gemini-3.6-flash(-medium), gemini-3.1-pro(-low) returned 404 from Google
+# Code Assist in live testing and were removed.
 ANTIGRAVITY_SUPPORTED_MODELS = [
-    {
-        "id": "gemini-4-argon",
-        "name": "Gemini 4 Argon (Thinking)",
-        "code_assist_model": "gemini-4-argon",
-        "description": "Gemini 4 Argon frontier reasoning and architecture model.",
-    },
-    {
-        "id": "argon",
-        "name": "Gemini 4 Argon",
-        "code_assist_model": "gemini-4-argon",
-        "description": "Gemini 4 Argon alias.",
-    },
     {
         "id": "gemini-3.8-flash",
         "name": "Gemini 3.8 Flash (Tiered Thinking)",
@@ -88,44 +85,26 @@ ANTIGRAVITY_SUPPORTED_MODELS = [
     {
         "id": "gemini-3.8-flash-high",
         "name": "Gemini 3.8 Flash High",
-        "code_assist_model": "gemini-3.8-flash-high",
+        "code_assist_model": "gemini-3.8-flash-tiered",
         "description": "Gemini 3.8 Flash high speed daily driver.",
     },
     {
         "id": "gemini-3.8-flash-medium",
         "name": "Gemini 3.8 Flash Medium",
-        "code_assist_model": "gemini-3.8-flash-high",
+        "code_assist_model": "gemini-3.8-flash-tiered",
         "description": "Gemini 3.8 Flash with medium reasoning budget.",
     },
     {
         "id": "gemini-3.8-flash-low",
         "name": "Gemini 3.8 Flash Low",
-        "code_assist_model": "gemini-3.8-flash-high",
+        "code_assist_model": "gemini-3.8-flash-tiered",
         "description": "Gemini 3.8 Flash with minimal reasoning latency.",
     },
     {
         "id": "gemini-3.7-flash",
-        "name": "Gemini 3.7 Flash High",
-        "code_assist_model": "gemini-3.7-flash-high",
-        "description": "Gemini 3.7 Flash with high reasoning budget and full tool use.",
-    },
-    {
-        "id": "gemini-3.7-flash-high",
-        "name": "Gemini 3.7 Flash High",
-        "code_assist_model": "gemini-3.7-flash-high",
-        "description": "Gemini 3.7 Flash high reasoning model.",
-    },
-    {
-        "id": "gemini-3.6-flash",
-        "name": "Gemini 3.6 Flash Medium",
-        "code_assist_model": "gemini-3.6-flash-medium",
-        "description": "Gemini 3.6 Flash with medium reasoning budget.",
-    },
-    {
-        "id": "gemini-3.1-pro",
-        "name": "Gemini 3.1 Pro Low",
-        "code_assist_model": "gemini-3.1-pro-low",
-        "description": "Gemini 3.1 Pro architecture and refactoring model.",
+        "name": "Gemini 3.7 Flash",
+        "code_assist_model": "gemini-3.8-flash-tiered",
+        "description": "Legacy Gemini 3.7 Flash name; served by Gemini 3.8 Flash (tiered) upstream.",
     },
     {
         "id": "claude-sonnet-4-6",
@@ -137,23 +116,17 @@ ANTIGRAVITY_SUPPORTED_MODELS = [
         "id": "claude-opus-4-6",
         "name": "Claude Opus 4.6 (Thinking)",
         "code_assist_model": "claude-sonnet-4-6",
-        "description": "Claude 3.7 / 4.6 Opus with deep reasoning via Antigravity.",
+        "description": "Opus requests are served by Claude Sonnet 4.6 upstream (no separate Opus endpoint).",
     },
     {
         "id": "gpt-oss-120b",
         "name": "GPT-OSS 120B (Medium)",
-        "code_assist_model": "gemini-3.8-flash-high",
-        "description": "GPT-OSS 120B open-weights model via Antigravity.",
+        "code_assist_model": "gemini-3.8-flash-tiered",
+        "description": "GPT-OSS name kept for compatibility; served by Gemini 3.8 Flash (tiered) upstream.",
     },
 ]
 
 MODEL_ALIAS_MAP = {
-    # Gemini 4 Argon
-    "gemini-4-argon": "gemini-4-argon",
-    "argon": "gemini-4-argon",
-    "argus": "gemini-4-argon",
-    "gemini-4": "gemini-4-argon",
-    "gemini-argon": "gemini-4-argon",
     # Gemini 3.8 Flash -> Tiered Thinking (gemini-3.8-flash-tiered)
     "gemini-3.8-flash": "gemini-3.8-flash-tiered",
     "gemini-3.8-flash-high": "gemini-3.8-flash-tiered",
@@ -167,24 +140,24 @@ MODEL_ALIAS_MAP = {
     # Gemini 3.7 Flash — maps to 3.8 tiered
     "gemini-3.7-flash": "gemini-3.8-flash-tiered",
     "gemini-3-flash": "gemini-3.8-flash-tiered",
-    "gemini-3.7-flash-high": "gemini-3.7-flash-high",
+    "gemini-3.7-flash-high": "gemini-3.8-flash-tiered",
     "gemini-3.7-flash-medium": "gemini-3.8-flash-tiered",
     "gemini-3.7-flash-low": "gemini-3.8-flash-tiered",
     # Gemini 3.7 Pro — fallback to 3.8 tiered
     "gemini-3.7-pro": "gemini-3.8-flash-tiered",
     "gemini-3-pro": "gemini-3.8-flash-tiered",
     "gemini-pro": "gemini-3.8-flash-tiered",
-    # Gemini 3.6 Flash
-    "gemini-3.6-flash": "gemini-3.6-flash-medium",
-    "gemini-3.6-flash-medium": "gemini-3.6-flash-medium",
+    # Gemini 3.6 Flash — upstream model removed by Google (404); fall back to tiered
+    "gemini-3.6-flash": "gemini-3.8-flash-tiered",
+    "gemini-3.6-flash-medium": "gemini-3.8-flash-tiered",
     # Gemini 3.5 Flash / 2.5 Flash — map to 3.8 flash tiered
     "gemini-3.5-flash": "gemini-3.8-flash-tiered",
     "gemini-3.5-flash-medium": "gemini-3.8-flash-tiered",
     "gemini-2.5-flash": "gemini-3.8-flash-tiered",
-    # Gemini 3.1 Pro
-    "gemini-3.1-pro": "gemini-3.1-pro-low",
-    "gemini-3.1-pro-low": "gemini-3.1-pro-low",
-    "gemini-2.5-pro": "gemini-3.1-pro-low",
+    # Gemini 3.1 Pro — upstream model removed by Google (404); fall back to tiered
+    "gemini-3.1-pro": "gemini-3.8-flash-tiered",
+    "gemini-3.1-pro-low": "gemini-3.8-flash-tiered",
+    "gemini-2.5-pro": "gemini-3.8-flash-tiered",
     # Claude Sonnet 4.6
     "claude-sonnet-4-6": "claude-sonnet-4-6",
     "claude-sonnet-4.6": "claude-sonnet-4-6",
@@ -201,14 +174,8 @@ MODEL_ALIAS_MAP = {
 
 
 VALID_CODE_ASSIST_MODELS = {
-    "gemini-4-argon",
-    "gemini-3.8-flash-high",
     "gemini-3.8-flash-tiered",
-    "gemini-3.7-flash-high",
-    "gemini-3.6-flash-medium",
-    "gemini-3.1-pro-low",
     "claude-sonnet-4-6",
-    "claude-opus-4-6",
 }
 
 
@@ -478,43 +445,6 @@ def _translate_tool_choice_to_gemini(tool_choice: Any) -> Optional[Dict[str, Any
     return None
 
 
-def _extract_tool_calls_from_text(text: str) -> tuple[List[Dict[str, Any]], str]:
-    """Parse text formatted like [Tool call: func_name(args)] or Action: Called func_name(args) into real tool calls."""
-    patterns = [
-        re.compile(r'\[Tool call:\s*([a-zA-Z0-9_\-\.]+)\s*\((.*?)\)\]', re.DOTALL),
-        re.compile(r'Action:\s*(?:Called\s+)?([a-zA-Z0-9_\-\.]+)\s*\((.*?)\)', re.DOTALL),
-    ]
-    tool_calls = []
-    cleaned_text = text
-    for pattern in patterns:
-        matches = list(pattern.finditer(cleaned_text))
-        for m in matches:
-            fn_name = m.group(1).strip()
-            raw_args = m.group(2).strip()
-            parsed_args = {}
-            if raw_args:
-                try:
-                    parsed_args = json.loads(raw_args)
-                except Exception:
-                    try:
-                        import ast
-                        parsed_args = ast.literal_eval(raw_args)
-                    except Exception:
-                        parsed_args = {"_raw": raw_args}
-            if not isinstance(parsed_args, dict):
-                parsed_args = {"_value": parsed_args}
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:12]}",
-                "type": "function",
-                "function": {
-                    "name": fn_name,
-                    "arguments": json.dumps(parsed_args, ensure_ascii=False),
-                },
-            })
-        cleaned_text = pattern.sub("", cleaned_text).strip()
-    return tool_calls, cleaned_text
-
-
 def build_code_assist_request(
     openai_payload: Dict[str, Any],
     project_id: str,
@@ -542,9 +472,18 @@ def build_code_assist_request(
             # parts when their functionCall counterparts lack real thoughtSignature.
             tool_text = _coerce_content_to_text(msg.get("content"))
             tool_name = msg.get("name") or msg.get("tool_call_id") or "tool"
+            if len(tool_text) > TOOL_RESULT_MAX_CHARS:
+                # Never truncate silently: keep the head and say exactly
+                # how much was dropped. (The old 2,000-char hard cut lost
+                # the tail of file reads and logs with no marker at all.)
+                omitted = len(tool_text) - TOOL_RESULT_MAX_CHARS
+                tool_text = (
+                    tool_text[:TOOL_RESULT_MAX_CHARS]
+                    + f"\n[... bridge truncated {omitted} of {len(tool_text)} characters ...]"
+                )
             contents.append({
                 "role": "user",
-                "parts": [{"text": f"[Tool result from {tool_name}: {tool_text[:2000]}]"}],
+                "parts": [{"text": f"[Tool result from {tool_name}: {tool_text}]"}],
             })
             continue
 
@@ -701,13 +640,6 @@ def translate_gemini_to_openai_response(
                     tc_item["thoughtSignature"] = ts
                     tc_item["extra_content"] = {"google": {"thought_signature": ts}}
                 tool_calls.append(tc_item)
-
-    # Fallback: if model emitted [Tool call: name(args)] in content_text instead of structured functionCall
-    if not tool_calls and content_text and "[Tool call:" in content_text:
-        extracted_calls, cleaned_text = _extract_tool_calls_from_text(content_text)
-        if extracted_calls:
-            tool_calls = extracted_calls
-            content_text = cleaned_text
 
     message: Dict[str, Any] = {
         "role": "assistant",
@@ -872,59 +804,6 @@ class AntigravityClient:
         async with self._http.stream("POST", url, json=envelope, headers=headers) as response:
             if response.status_code != 200:
                 body = await response.aread()
-                # Debug: log payload structure on 400 errors
-                if response.status_code == 400:
-                    contents = envelope.get("request", {}).get("contents", [])
-                    roles = [c.get("role", "?") for c in contents]
-                    # Find consecutive same-role pairs
-                    violations = []
-                    for i in range(1, len(roles)):
-                        if roles[i] == roles[i-1]:
-                            violations.append(f"[{i-1}:{roles[i-1]},{i}:{roles[i]}]")
-                    # Find empty parts
-                    empty_parts = [i for i, c in enumerate(contents) if not c.get("parts")]
-                    # Check for parts with unsupported content
-                    part_types = set()
-                    for c in contents:
-                        for p in c.get("parts", []):
-                            part_types.update(p.keys())
-                    logger.error(
-                        "DEBUG 400: contents=%d, roles_start=%s, roles_end=%s, "
-                        "violations=%s, empty_parts=%s, part_types=%s, "
-                        "model=%s, first_role=%s, last_role=%s",
-                        len(contents),
-                        roles[:5], roles[-5:],
-                        violations[:10] if violations else "none",
-                        empty_parts[:10] if empty_parts else "none",
-                        part_types,
-                        envelope.get("model", "?"),
-                        roles[0] if roles else "?",
-                        roles[-1] if roles else "?",
-                    )
-                    # Dump payload structure (not full content) for analysis
-                    try:
-                        debug_dump = []
-                        for i, c in enumerate(contents):
-                            parts_info = []
-                            for p in c.get("parts", []):
-                                pinfo = {k: (str(v)[:50] if isinstance(v, str) else type(v).__name__)
-                                         for k, v in p.items()}
-                                parts_info.append(pinfo)
-                            debug_dump.append({
-                                "idx": i,
-                                "role": c.get("role"),
-                                "num_parts": len(c.get("parts", [])),
-                                "parts": parts_info,
-                            })
-                        import tempfile
-                        dump_path = os.path.join(
-                            tempfile.gettempdir(), "antigravity_debug_400.json"
-                        )
-                        with open(dump_path, "w", encoding="utf-8") as f:
-                            json.dump(debug_dump, f, indent=2, ensure_ascii=False)
-                        logger.error("DEBUG 400: payload structure dumped to %s", dump_path)
-                    except Exception as dump_err:
-                        logger.error("DEBUG 400: failed to dump: %s", dump_err)
                 raise CodeAssistError(
                     response.status_code,
                     body.decode("utf-8", "replace"),
